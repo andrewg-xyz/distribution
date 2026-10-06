@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/distribution/distribution/v3/manifest/ocischema"
@@ -30,6 +31,7 @@ import (
 	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
@@ -2272,6 +2274,21 @@ func newTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
 	return newTestEnvWithConfig(t, &config)
 }
 
+func newFilesystemTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
+			"delete":     configuration.Parameters{"enabled": deleteEnabled},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+
+	return newTestEnvWithConfig(t, &config)
+}
+
 func newTestEnvWithConfig(t *testing.T, config *configuration.Configuration) *testEnv {
 	ctx := context.Background()
 
@@ -3670,4 +3687,142 @@ func TestReferrersAPI(t *testing.T) {
 	if len(noRefIndex.Manifests) != 0 {
 		t.Errorf("expected 0 referrers, got %d", len(noRefIndex.Manifests))
 	}
+}
+
+func TestReferrersConcurrentPushes(t *testing.T) {
+	env := newFilesystemTestEnv(t, true)
+	defer env.Shutdown()
+
+	repo, err := reference.WithName("test/concurrent-referrers")
+	if err != nil {
+		t.Fatalf("creating repository name: %v", err)
+	}
+	subject := testManifestAPISchema2(t, env, repo, "subject")
+	_, subjectPayload, err := subject.manifest.Payload()
+	if err != nil {
+		t.Fatalf("getting subject payload: %v", err)
+	}
+	subjectDigest := digest.FromBytes(subjectPayload)
+	pushScratch(t, env, repo)
+
+	type push struct {
+		digest digest.Digest
+		url    string
+		media  string
+		body   []byte
+	}
+
+	const artifactType = "application/vnd.example.concurrent"
+	pushes := make([]push, 0, 16)
+	expected := make(map[digest.Digest]struct{})
+	for i := range 8 {
+		dgst, media, body := referrerArtifactPayload(t, subjectDigest, artifactType, fmt.Sprintf("distinct-%d", i))
+		ref, err := reference.WithDigest(repo, dgst)
+		if err != nil {
+			t.Fatalf("creating artifact reference: %v", err)
+		}
+		manifestURL, err := env.builder.BuildManifestURL(ref)
+		if err != nil {
+			t.Fatalf("building artifact URL: %v", err)
+		}
+		pushes = append(pushes, push{digest: dgst, url: manifestURL, media: media, body: body})
+		expected[dgst] = struct{}{}
+	}
+
+	duplicateDigest, duplicateMedia, duplicateBody := referrerArtifactPayload(t, subjectDigest, artifactType, "duplicate")
+	duplicateRef, err := reference.WithDigest(repo, duplicateDigest)
+	if err != nil {
+		t.Fatalf("creating duplicate artifact reference: %v", err)
+	}
+	duplicateURL, err := env.builder.BuildManifestURL(duplicateRef)
+	if err != nil {
+		t.Fatalf("building duplicate artifact URL: %v", err)
+	}
+	for range 8 {
+		pushes = append(pushes, push{digest: duplicateDigest, url: duplicateURL, media: duplicateMedia, body: duplicateBody})
+	}
+	expected[duplicateDigest] = struct{}{}
+
+	start := make(chan struct{})
+	results := make(chan error, len(pushes))
+	var wg sync.WaitGroup
+	for _, work := range pushes {
+		wg.Add(1)
+		go func(push push) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodPut, push.url, bytes.NewReader(push.body))
+			if err == nil {
+				req.Header.Set("Content-Type", push.media)
+				var response *http.Response
+				response, err = http.DefaultClient.Do(req)
+				if err == nil {
+					response.Body.Close()
+					if response.StatusCode != http.StatusCreated {
+						err = fmt.Errorf("manifest push status = %d", response.StatusCode)
+					}
+				}
+			}
+			results <- err
+		}(work)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+
+	referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", env.server.URL, repo.Name(), subjectDigest)
+	response, err := http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("getting referrers: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("referrers status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+
+	var index v1.Index
+	if err := json.NewDecoder(response.Body).Decode(&index); err != nil {
+		t.Fatalf("decoding referrers response: %v", err)
+	}
+	if len(index.Manifests) != len(expected) {
+		t.Fatalf("referrers count = %d, want %d", len(index.Manifests), len(expected))
+	}
+	seen := make(map[digest.Digest]int)
+	for _, descriptor := range index.Manifests {
+		seen[descriptor.Digest]++
+	}
+	for dgst := range expected {
+		if seen[dgst] != 1 {
+			t.Errorf("referrer %s appears %d times, want 1", dgst, seen[dgst])
+		}
+	}
+}
+
+func referrerArtifactPayload(t *testing.T, subject digest.Digest, artifactType, annotation string) (digest.Digest, string, []byte) {
+	t.Helper()
+
+	manifest, err := ocischema.FromStruct(ocischema.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		ArtifactType: artifactType,
+		Config:       emptyJSONDescriptor,
+		Subject: &v1.Descriptor{
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    subject,
+		},
+		Annotations: map[string]string{"org.opencontainers.image.ref.name": annotation},
+	})
+	if err != nil {
+		t.Fatalf("creating referrer artifact: %v", err)
+	}
+	mediaType, payload, err := manifest.Payload()
+	if err != nil {
+		t.Fatalf("getting referrer artifact payload: %v", err)
+	}
+
+	return digest.FromBytes(payload), mediaType, payload
 }
