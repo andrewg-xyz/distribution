@@ -51,21 +51,26 @@ func (ms *ocischemaManifestHandler) Put(ctx context.Context, manifest distributi
 		return "", err
 	}
 
-	if referrer, ok := manifest.(distribution.Referrer); ok {
-		if subject := referrer.Subject(); subject != nil {
-			if err := ms.references.Link(ctx, referrer.Type(), digest.FromBytes(payload), subject.Digest); err != nil {
-				return "", err
-			}
-		}
-	}
-
 	revision, err := ms.blobStore.Put(ctx, mt, payload)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
 		return "", err
 	}
 
+	if err := linkReferrer(ctx, ms.references, manifest, revision.Digest); err != nil {
+		return "", err
+	}
+
 	return revision.Digest, nil
+}
+
+func linkReferrer(ctx context.Context, references ReferenceService, manifest distribution.Manifest, revision digest.Digest) error {
+	referrer, ok := manifest.(distribution.Referrer)
+	if !ok || referrer.Subject() == nil {
+		return nil
+	}
+
+	return references.Link(ctx, referrer.Type(), revision, referrer.Subject().Digest)
 }
 
 // verifyManifest ensures that the manifest content is valid from the

@@ -18,6 +18,7 @@ type manifestListHandler struct {
 	blobStore            distribution.BlobStore
 	ctx                  context.Context
 	validateImageIndexes validateImageIndexes
+	references           ReferenceService
 }
 
 var _ ManifestHandler = &manifestListHandler{}
@@ -63,6 +64,10 @@ func (ms *manifestListHandler) Put(ctx context.Context, manifestList distributio
 	revision, err := ms.blobStore.Put(ctx, mt, payload)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
+		return "", err
+	}
+
+	if err := linkReferrer(ctx, ms.references, manifestList, revision.Digest); err != nil {
 		return "", err
 	}
 

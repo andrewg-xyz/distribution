@@ -2938,6 +2938,28 @@ func TestArtifactManifest(t *testing.T) {
 				return manifest
 			},
 		},
+		"image_index_with_subject": {
+			manifest: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Manifest {
+				index := &ocischema.DeserializedImageIndex{}
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					MediaType:    v1.MediaTypeImageIndex,
+					ArtifactType: "application/vnd.example.sbom.v1",
+					Subject: &v1.Descriptor{
+						MediaType: v1.MediaTypeImageManifest,
+						Digest:    "sha256:ebe054f08821294feee7bc442014fdd38b4836d83781d8ba99d38eb50d0c9d85",
+						Size:      99,
+					},
+				})
+				if err != nil {
+					t.Fatalf("Failed to create image index payload: %s", err)
+				}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("Failed to create image index: %s", err)
+				}
+				return index
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			testEnv := newTestEnv(t, true)
@@ -3010,8 +3032,12 @@ func TestArtifactManifest(t *testing.T) {
 				t.Fatalf("Failed to GET manifest: %s", err)
 			}
 			defer res.Body.Close()
-			if res.StatusCode != http.StatusNotAcceptable {
-				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotAcceptable)
+			expectedStatus := http.StatusNotAcceptable
+			if contentType == v1.MediaTypeImageIndex {
+				expectedStatus = http.StatusOK
+			}
+			if res.StatusCode != expectedStatus {
+				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, expectedStatus)
 			}
 
 			req.Header.Set("Accept", contentType)

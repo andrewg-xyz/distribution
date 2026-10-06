@@ -282,11 +282,18 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 		linkDirectoryPathSpec: manifestDirectoryPathSpec,
 	}
 
+	references := &referenceHandler{
+		blobStore:  repo.blobStore,
+		repository: repo,
+		pathFn:     subjectReferrerLinkPath,
+	}
+
 	manifestListHandler := &manifestListHandler{
 		ctx:                  ctx,
 		repository:           repo,
 		blobStore:            blobStore,
 		validateImageIndexes: repo.validateImageIndexes,
+		references:           references,
 	}
 
 	ms := &manifestStore{
@@ -305,11 +312,7 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 			repository:   repo,
 			blobStore:    blobStore,
 			manifestURLs: repo.registry.manifestURLs,
-			references: &referenceHandler{
-				blobStore:  repo.blobStore,
-				repository: repo,
-				pathFn:     subjectReferrerLinkPath,
-			},
+			references:   references,
 		},
 		ocischemaIndexHandler: &ocischemaIndexHandler{
 			manifestListHandler: manifestListHandler,
