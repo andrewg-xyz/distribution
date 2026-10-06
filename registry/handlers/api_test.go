@@ -18,7 +18,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/distribution/distribution/v3/manifest/ocischema"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/configuration"
@@ -28,6 +31,7 @@ import (
 	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
@@ -38,9 +42,16 @@ import (
 	hookstest "github.com/sirupsen/logrus/hooks/test"
 )
 
-var headerConfig = http.Header{
-	"X-Content-Type-Options": []string{"nosniff"},
-}
+var (
+	headerConfig = http.Header{
+		"X-Content-Type-Options": []string{"nosniff"},
+	}
+	emptyJSONDescriptor = distribution.Descriptor{
+		MediaType: v1.DescriptorEmptyJSON.MediaType,
+		Size:      v1.DescriptorEmptyJSON.Size,
+		Digest:    v1.DescriptorEmptyJSON.Digest,
+	}
+)
 
 const (
 	// digestSha256EmptyTar is the canonical sha256 digest of empty data
@@ -1539,6 +1550,33 @@ type mockErrorDriver struct {
 	returnErrs []mockErrorMapping
 }
 
+const referrerLinkFailureDriverName = "referrerlinkfailure"
+
+var registerReferrerLinkFailureDriver sync.Once
+
+type referrerLinkFailureDriverFactory struct{}
+
+func (f *referrerLinkFailureDriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
+	driver, err := factory.Create(ctx, "inmemory", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &referrerLinkFailureDriver{StorageDriver: driver}, nil
+}
+
+type referrerLinkFailureDriver struct {
+	storagedriver.StorageDriver
+}
+
+func (driver *referrerLinkFailureDriver) PutContent(ctx context.Context, path string, content []byte) error {
+	if strings.Contains(path, "_referrers") {
+		return errors.New("injected referrer link failure")
+	}
+
+	return driver.StorageDriver.PutContent(ctx, path, content)
+}
+
 func (dr *mockErrorDriver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	for _, returns := range dr.returnErrs {
 		if strings.Contains(path, returns.pathMatch) {
@@ -2361,6 +2399,40 @@ func newTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
 	return newTestEnvWithConfig(t, &config)
 }
 
+func newFilesystemTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
+			"delete":     configuration.Parameters{"enabled": deleteEnabled},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+
+	return newTestEnvWithConfig(t, &config)
+}
+
+func newReferrerLinkFailureTestEnv(t *testing.T) *testEnv {
+	registerReferrerLinkFailureDriver.Do(func() {
+		factory.Register(referrerLinkFailureDriverName, &referrerLinkFailureDriverFactory{})
+	})
+
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			referrerLinkFailureDriverName: configuration.Parameters{},
+			"delete":                      configuration.Parameters{"enabled": true},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+
+	return newTestEnvWithConfig(t, &config)
+}
+
 func newTestEnvWithConfig(t *testing.T, config *configuration.Configuration) *testEnv {
 	ctx := context.Background()
 
@@ -2963,4 +3035,1049 @@ func TestProxyManifestGetByTag(t *testing.T) {
 	checkHeaders(t, resp, http.Header{
 		"Docker-Content-Digest": []string{newDigest.String()},
 	})
+}
+
+func TestArtifactManifest(t *testing.T) {
+	for name, test := range map[string]struct {
+		manifest      func(*testing.T, *testEnv, reference.Named) distribution.Manifest
+		deleteSubject bool
+	}{
+		// The link is made when the subject already exists and is kept if the
+		// subject is deleted
+		"subject_exists": {
+			manifest: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Manifest {
+				args := testManifestAPISchema2(t, testEnv, repo, "schema2tag")
+				_, payload, err := args.manifest.Payload()
+				if err != nil {
+					t.Fatalf("Failed to get subject payload: %s", err)
+				}
+
+				pushScratch(t, testEnv, repo)
+
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					ArtifactType: "application/vnd.example.sbom.v1",
+					Config:       emptyJSONDescriptor,
+					Subject: &distribution.Descriptor{
+						MediaType: args.mediaType,
+						Digest:    args.dgst,
+						Size:      int64(len(payload)),
+					},
+				})
+				if err != nil {
+					t.Fatalf("Failed to create manifest: %s", err)
+				}
+				return manifest
+			},
+			deleteSubject: true,
+		},
+		// When an OCI Image Manifest with a subject field is PUT before its
+		// subject, the subject's referrers link will be made in advance.
+		"image_manifest_with_subject": {
+			manifest: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Manifest {
+				config, configDigest, err := testutil.CreateRandomTarFile()
+				if err != nil {
+					t.Fatalf("Failed to create test blob: %s", err)
+				}
+				url, _ := startPushLayer(t, testEnv, repo)
+				pushLayer(t, testEnv.builder, repo, configDigest, url, config)
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned: specs.Versioned{SchemaVersion: 2},
+					Config: distribution.Descriptor{
+						MediaType: v1.MediaTypeImageConfig,
+						Digest:    configDigest,
+					},
+					Subject: &distribution.Descriptor{
+						MediaType: v1.MediaTypeImageManifest,
+						Digest:    "sha256:ebe054f08821294feee7bc442014fdd38b4836d83781d8ba99d38eb50d0c9d85",
+						Size:      99,
+					},
+				})
+				if err != nil {
+					t.Fatalf("Failed to create manifest: %s", err)
+				}
+				return manifest
+			},
+		},
+		"image_index_with_subject": {
+			manifest: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Manifest {
+				index := &ocischema.DeserializedImageIndex{}
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					MediaType:    v1.MediaTypeImageIndex,
+					ArtifactType: "application/vnd.example.sbom.v1",
+					Subject: &v1.Descriptor{
+						MediaType: v1.MediaTypeImageManifest,
+						Digest:    "sha256:ebe054f08821294feee7bc442014fdd38b4836d83781d8ba99d38eb50d0c9d85",
+						Size:      99,
+					},
+				})
+				if err != nil {
+					t.Fatalf("Failed to create image index payload: %s", err)
+				}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("Failed to create image index: %s", err)
+				}
+				return index
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testEnv := newTestEnv(t, true)
+			defer testEnv.Shutdown()
+
+			repo, err := reference.WithName("myrepo/myimage")
+			if err != nil {
+				t.Fatalf("failed to make repo: %s", err)
+			}
+
+			manifest := test.manifest(t, testEnv, repo)
+
+			contentType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("Failed to get raw manifest: %s", err)
+			}
+			ref, err := reference.WithDigest(repo, digest.FromBytes(payload))
+			if err != nil {
+				t.Fatalf("failed to make reference: %s", err)
+			}
+
+			manifestURL, err := testEnv.builder.BuildManifestURL(ref)
+			if err != nil {
+				t.Fatalf("Failed to build manifest URL: %s", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("Failed to create artifact PUT request: %s", err)
+			}
+			req.Header.Set("Content-Type", contentType)
+
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to PUT manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusCreated {
+				t.Fatalf("Incorrect status code for manifest PUT: %d, expected: %d", res.StatusCode, http.StatusCreated)
+			}
+			if res.Header.Get("Docker-Content-Digest") != ref.Digest().String() {
+				t.Errorf("Incorrect Docker-Content-Digest header: %q, expected %q", res.Header.Get("Docker-Content-Digest"), ref.Digest().String())
+			}
+
+			// TODO(brackendawson): We should now try to get referrers for the subject
+			// (which should also eventually exist for that to work), but those APIs
+			// don't exist yet so for now just check the link was made.
+			referrer, ok := manifest.(distribution.Referrer)
+			if !ok {
+				t.Fatalf("Manifest should implement distribution.Referrer: %T", manifest)
+			}
+			link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+				repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
+			if err != nil {
+				t.Fatalf("Failed to get expected referrers link from subject with error: %s", err)
+			}
+			if string(link) != ref.Digest().String() {
+				t.Errorf("Subject's referrers link has incorrect content:\n%s\nexpected:\n%s", string(link), ref.Digest().String())
+			}
+
+			// When an artifact manifest has been PUT it can be retrieved with GET.
+			location := res.Header.Get("Location")
+			req, err = http.NewRequest(http.MethodGet, location, nil)
+			if err != nil {
+				t.Fatalf("Failed to create artifact GET request: %s", err)
+			}
+
+			res, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to GET manifest: %s", err)
+			}
+			defer res.Body.Close()
+			expectedStatus := http.StatusNotAcceptable
+			if contentType == v1.MediaTypeImageIndex {
+				expectedStatus = http.StatusOK
+			}
+			if res.StatusCode != expectedStatus {
+				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, expectedStatus)
+			}
+
+			req.Header.Set("Accept", contentType)
+			res, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to GET manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusOK)
+			}
+			if res.Header.Get("Content-Type") != contentType {
+				t.Errorf("Incorrect mediaType for manifest GET: %q, expected: %q", res.Header.Get("Content-Type"), contentType)
+			}
+			gotManifest, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("Failed to read manifest GET body: %s", err)
+			}
+			if !reflect.DeepEqual(gotManifest, payload) {
+				t.Errorf("Pulled manifest does not match pushed manifest, got:\n%s\nexpected:\n%s", string(gotManifest), string(payload))
+			}
+
+			if test.deleteSubject {
+				// When a subject is deleted, it's referrers link remains
+				subjectRef, err := reference.WithDigest(repo, referrer.Subject().Digest)
+				if err != nil {
+					t.Fatalf("Failed to build subject reference: %s", err)
+				}
+				subjectURL, err := testEnv.builder.BuildManifestURL(subjectRef)
+				if err != nil {
+					t.Errorf("Failed to build subject URL: %s", err)
+				}
+
+				req, err := http.NewRequest(http.MethodDelete, subjectURL, nil)
+				if err != nil {
+					t.Fatalf("Failed to create subject DELETE request: %s", err)
+				}
+				res, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("Failed to DELETE subject: %s", err)
+				}
+				defer res.Body.Close()
+				if res.StatusCode != http.StatusAccepted {
+					t.Fatalf("Incorrect status code for subject DELETE: %s", err)
+				}
+
+				// TODO(brackendawson): We should now try to get referrers for the subject
+				// (which should also eventually exist for that to work), but those APIs
+				// don't exist yet so for now just check the link still exists.
+				link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+					repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
+				if err != nil {
+					t.Fatalf("Failed to get expected referrers link from subject with error: %s", err)
+				}
+				if string(link) != ref.Digest().String() {
+					t.Errorf("Subject's referrers link has incorrect content:\n%s\nexpected:\n%s", string(link), ref.Digest().String())
+				}
+			}
+
+			// When an artifact manifest is DELETEd then it will not be found if you GET
+			// it. Its subject's referrer link will be left dangling.
+			req, err = http.NewRequest(http.MethodDelete, location, nil)
+			if err != nil {
+				t.Fatalf("Failed to create artifact DELETE request: %s", err)
+			}
+
+			res, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to DELETE manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusAccepted {
+				t.Fatalf("Incorrect status code for manifest DELETE: %d, expected: %d", res.StatusCode, http.StatusAccepted)
+			}
+
+			req, err = http.NewRequest(http.MethodGet, location, nil)
+			if err != nil {
+				t.Fatalf("Failed to create artifact GET request: %s", err)
+			}
+			req.Header.Set("Accept", v1.MediaTypeImageManifest)
+			res, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to GET manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusNotFound {
+				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+func TestManifestPutOCISubjectHeader(t *testing.T) {
+	subject := v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    v1.DescriptorEmptyJSON.Digest,
+		Size:      v1.DescriptorEmptyJSON.Size,
+	}
+
+	for name, test := range map[string]struct {
+		manifest func(*testing.T, *v1.Descriptor) distribution.Manifest
+		byDigest bool
+		subject  *v1.Descriptor
+	}{
+		"image_manifest_by_tag_with_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					ArtifactType: "application/vnd.example.artifact",
+					Config:       emptyJSONDescriptor,
+					Subject:      subject,
+				})
+				if err != nil {
+					t.Fatalf("creating OCI image manifest: %v", err)
+				}
+				return manifest
+			},
+			subject: &subject,
+		},
+		"image_manifest_by_digest_without_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					ArtifactType: "application/vnd.example.artifact",
+					Config:       emptyJSONDescriptor,
+					Subject:      subject,
+				})
+				if err != nil {
+					t.Fatalf("creating OCI image manifest: %v", err)
+				}
+				return manifest
+			},
+			byDigest: true,
+		},
+		"image_index_by_tag_without_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned: specs.Versioned{SchemaVersion: 2},
+					MediaType: v1.MediaTypeImageIndex,
+					Subject:   subject,
+				})
+				if err != nil {
+					t.Fatalf("marshaling OCI image index: %v", err)
+				}
+				index := &ocischema.DeserializedImageIndex{}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("creating OCI image index: %v", err)
+				}
+				return index
+			},
+		},
+		"image_index_by_digest_with_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned: specs.Versioned{SchemaVersion: 2},
+					MediaType: v1.MediaTypeImageIndex,
+					Subject:   subject,
+				})
+				if err != nil {
+					t.Fatalf("marshaling OCI image index: %v", err)
+				}
+				index := &ocischema.DeserializedImageIndex{}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("creating OCI image index: %v", err)
+				}
+				return index
+			},
+			byDigest: true,
+			subject:  &subject,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t, true)
+			defer env.Shutdown()
+
+			repo, err := reference.WithName("test/oci-subject")
+			if err != nil {
+				t.Fatalf("creating repository name: %v", err)
+			}
+			pushScratch(t, env, repo)
+
+			manifest := test.manifest(t, test.subject)
+			mediaType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting manifest payload: %v", err)
+			}
+
+			var manifestURL string
+			if test.byDigest {
+				ref, err := reference.WithDigest(repo, digest.FromBytes(payload))
+				if err == nil {
+					manifestURL, err = env.builder.BuildManifestURL(ref)
+				}
+			} else {
+				ref, err := reference.WithTag(repo, "latest")
+				if err == nil {
+					manifestURL, err = env.builder.BuildManifestURL(ref)
+				}
+			}
+			if err != nil {
+				t.Fatalf("creating manifest reference: %v", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("creating manifest PUT request: %v", err)
+			}
+			req.Header.Set("Content-Type", mediaType)
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("putting manifest: %v", err)
+			}
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusCreated {
+				t.Fatalf("unexpected manifest PUT status: %d", res.StatusCode)
+			}
+
+			wantSubject := ""
+			if test.subject != nil {
+				wantSubject = test.subject.Digest.String()
+			}
+			if gotSubject := res.Header.Get("OCI-Subject"); gotSubject != wantSubject {
+				t.Errorf("OCI-Subject = %q, want %q", gotSubject, wantSubject)
+			}
+		})
+	}
+}
+
+func TestDockerManifestWithSubject(t *testing.T) {
+	// When a docker image manifest containing a "subject" field is uploaded
+	// then no referrer links are made for that invalid subject.
+	testEnv := newTestEnv(t, true)
+	defer testEnv.Shutdown()
+
+	repo, err := reference.WithName("test/repo")
+	if err != nil {
+		t.Fatalf("Failed to build repo: %s", err)
+	}
+
+	config, configDigest, err := testutil.CreateRandomTarFile()
+	if err != nil {
+		t.Fatalf("Failed to make config blob: %s", err)
+	}
+	url, _ := startPushLayer(t, testEnv, repo)
+	pushLayer(t, testEnv.builder, repo, configDigest, url, config)
+	layer, layerDigest, err := testutil.CreateRandomTarFile()
+	if err != nil {
+		t.Fatalf("Failed to make layer blob: %s", err)
+	}
+	url, _ = startPushLayer(t, testEnv, repo)
+	pushLayer(t, testEnv.builder, repo, layerDigest, url, layer)
+
+	manifest, err := schema2.FromStruct(schema2.Manifest{
+		Versioned: specs.Versioned{
+			SchemaVersion: 2,
+		},
+		MediaType: schema2.MediaTypeManifest,
+		Config: distribution.Descriptor{
+			MediaType: schema2.MediaTypeImageConfig,
+			Digest:    configDigest,
+			Size:      testutil.MustSeekerLen(config),
+		},
+		Layers: []distribution.Descriptor{
+			{
+				MediaType: schema2.MediaTypeLayer,
+				Digest:    layerDigest,
+				Size:      testutil.MustSeekerLen(layer),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to make base manifest: %s", err)
+	}
+	var manifestFields map[string]interface{}
+	_, payload, err := manifest.Payload()
+	if err != nil {
+		t.Fatalf("Failed to get base manifest payload: %s", err)
+	}
+	if err = json.Unmarshal(payload, &manifestFields); err != nil {
+		t.Fatalf("Failed to unmarshal base manifest: %s", err)
+	}
+	manifestFields["subject"] = distribution.Descriptor{
+		MediaType: schema2.MediaTypeManifest,
+		Digest:    "sha256:118011bef6c697f7107cc0d788664a0f8c7d0316ce8d17673634155f5ecdba39",
+		Size:      56,
+	}
+	rawManifest, _ := json.Marshal(manifestFields)
+	if err = manifest.UnmarshalJSON(rawManifest); err != nil {
+		t.Fatalf("Failed to re-build manifest: %s", err)
+	}
+
+	ref, err := reference.WithTag(repo, "latest")
+	if err != nil {
+		t.Fatalf("Failed to build reference: %s", err)
+	}
+	if url, err = testEnv.builder.BuildManifestURL(ref); err != nil {
+		t.Fatalf("Failed to build manifest url: %s", err)
+	}
+	res := putManifest(t, "putting manifest", url, schema2.MediaTypeManifest, manifest)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("Incorrect status code from manifest PUT: %d, expected: %d", res.StatusCode, http.StatusCreated)
+	}
+	defer res.Body.Close()
+
+	// TODO(brackendawson): We should now try to get referrers for the subject
+	// (which should also eventually exist for that to work), but those APIs
+	// don't exist yet so for now just check the link was not made.
+	_, err = testEnv.app.driver.Stat(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers",
+		repo.Name(), res.Header.Get("Docker-Content-Digest")))
+	var expectedErr storagedriver.InvalidPathError
+	if !errors.As(err, &expectedErr) {
+		t.Fatalf("Should have got invalid path error for referrer directory: %s", err)
+	}
+}
+
+func TestArtifactManifestValidation(t *testing.T) {
+	for name, test := range map[string]struct {
+		config   func(*testing.T, *testEnv, reference.Named) distribution.Descriptor
+		layers   func(*testing.T, *testEnv, reference.Named) []distribution.Descriptor
+		wantCode int
+	}{
+		"layers_must_exist": {
+			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
+				pushScratch(t, testEnv, repo)
+				return emptyJSONDescriptor
+			},
+			layers: func(t *testing.T, te *testEnv, n reference.Named) []distribution.Descriptor {
+				// a layer which has not been uploaded
+				return []distribution.Descriptor{
+					{
+						MediaType: v1.MediaTypeImageLayer,
+						Digest:    "sha256:7688b6ef52555962d008fff894223582c484517cea7da49ee67800adc7fc8866",
+						Size:      56,
+					},
+				}
+			},
+			wantCode: 400,
+		},
+		"config_must_be_set": {
+			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
+				return distribution.Descriptor{} // zero value
+			},
+			layers: func(t *testing.T, testEnv *testEnv, repo reference.Named) []distribution.Descriptor {
+				layers := int64(10)
+				digests := make([]distribution.Descriptor, layers)
+				for i := int64(0); i < layers; i++ {
+					rs, digest, err := testutil.CreateRandomTarFile()
+					if err != nil {
+						t.Fatalf("Failed to create test blob: %s", err)
+					}
+					url, _ := startPushLayer(t, testEnv, repo)
+					pushLayer(t, testEnv.builder, repo, digest, url, rs)
+					digests[i] = distribution.Descriptor{
+						MediaType: v1.MediaTypeImageLayer,
+						Digest:    digest,
+						Size:      testutil.MustSeekerLen(rs),
+					}
+				}
+				return digests
+			},
+			wantCode: 400,
+		},
+		"config_must_exist": {
+			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
+				return emptyJSONDescriptor // not uploaded
+			},
+			layers: func(t *testing.T, testEnv *testEnv, repo reference.Named) []distribution.Descriptor {
+				layers := int64(10)
+				digests := make([]distribution.Descriptor, layers)
+				for i := int64(0); i < layers; i++ {
+					rs, digest, err := testutil.CreateRandomTarFile()
+					if err != nil {
+						t.Fatalf("Failed to create test blob: %s", err)
+					}
+					url, _ := startPushLayer(t, testEnv, repo)
+					pushLayer(t, testEnv.builder, repo, digest, url, rs)
+					digests[i] = distribution.Descriptor{
+						MediaType: v1.MediaTypeImageLayer,
+						Digest:    digest,
+						Size:      testutil.MustSeekerLen(rs),
+					}
+				}
+				return digests
+			},
+			wantCode: 400,
+		},
+		"valid_blobs": {
+			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
+				pushScratch(t, testEnv, repo)
+				return emptyJSONDescriptor
+			},
+			layers: func(t *testing.T, testEnv *testEnv, repo reference.Named) []distribution.Descriptor {
+				layers := int64(10)
+				digests := make([]distribution.Descriptor, layers)
+				for i := int64(0); i < layers; i++ {
+					rs, digest, err := testutil.CreateRandomTarFile()
+					if err != nil {
+						t.Fatalf("Failed to create test blob: %s", err)
+					}
+					url, _ := startPushLayer(t, testEnv, repo)
+					pushLayer(t, testEnv.builder, repo, digest, url, rs)
+					digests[i] = distribution.Descriptor{
+						MediaType: v1.MediaTypeImageLayer,
+						Digest:    digest,
+						Size:      testutil.MustSeekerLen(rs),
+					}
+				}
+				return digests
+			},
+			wantCode: 201,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testEnv := newTestEnv(t, true)
+			defer testEnv.Shutdown()
+
+			repo, err := reference.WithName("myrepo/myimage")
+			if err != nil {
+				t.Fatalf("failed to make repo: %s", err)
+			}
+
+			manifest, err := ocischema.FromStruct(ocischema.Manifest{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				Config:       test.config(t, testEnv, repo),
+				ArtifactType: "application/vnd.example.sbom.v1",
+				Layers:       test.layers(t, testEnv, repo),
+			})
+			if err != nil {
+				t.Fatalf("Failed to make manifest: %s", err)
+			}
+
+			contentType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("Failed to get raw manifest: %s", err)
+			}
+			ref, err := reference.WithDigest(repo, digest.FromBytes(payload))
+			if err != nil {
+				t.Fatalf("failed to make reference: %s", err)
+			}
+
+			manifestURL, err := testEnv.builder.BuildManifestURL(ref)
+			if err != nil {
+				t.Fatalf("Failed to build manifest URL: %s", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("Failed to create artifact PUT request: %s", err)
+			}
+			req.Header.Set("Content-Type", contentType)
+
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to PUT manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != test.wantCode {
+				t.Fatalf("Incorrect status code for manifest PUT: %d, expected: %d", res.StatusCode, test.wantCode)
+			}
+		})
+	}
+}
+
+func pushScratch(t *testing.T, testEnv *testEnv, repo reference.Named) {
+	url, _ := startPushLayer(t, testEnv, repo)
+	pushLayer(t, testEnv.builder, repo, v1.DescriptorEmptyJSON.Digest, url, bytes.NewBuffer(v1.DescriptorEmptyJSON.Data))
+}
+
+func TestReferrersAPI(t *testing.T) {
+	testEnv := newTestEnv(t, true)
+	defer testEnv.Shutdown()
+
+	repo, err := reference.WithName("test/referrers")
+	if err != nil {
+		t.Fatalf("failed to make repo: %s", err)
+	}
+
+	// 1. Create a subject manifest (a normal image manifest).
+	args := testManifestAPISchema2(t, testEnv, repo, "subject-tag")
+	_, subjectPayload, err := args.manifest.Payload()
+	if err != nil {
+		t.Fatalf("failed to get subject payload: %s", err)
+	}
+	subjectDigest := digest.FromBytes(subjectPayload)
+
+	// 2. Push an OCI artifact manifest that references the subject.
+	pushScratch(t, testEnv, repo)
+	artifactManifest, err := ocischema.FromStruct(ocischema.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    v1.MediaTypeImageManifest,
+		ArtifactType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+		Config:       emptyJSONDescriptor,
+		Subject: &distribution.Descriptor{
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    subjectDigest,
+			Size:      int64(len(subjectPayload)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create artifact manifest: %s", err)
+	}
+
+	_, artifactPayload, err := artifactManifest.Payload()
+	if err != nil {
+		t.Fatalf("failed to get artifact payload: %s", err)
+	}
+	artifactDigest := digest.FromBytes(artifactPayload)
+
+	artifactRef, err := reference.WithDigest(repo, artifactDigest)
+	if err != nil {
+		t.Fatalf("failed to make reference: %s", err)
+	}
+	manifestURL, err := testEnv.builder.BuildManifestURL(artifactRef)
+	if err != nil {
+		t.Fatalf("failed to build manifest URL: %s", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(artifactPayload))
+	if err != nil {
+		t.Fatalf("failed to create PUT request: %s", err)
+	}
+	req.Header.Set("Content-Type", v1.MediaTypeImageManifest)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to PUT artifact manifest: %s", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected status for artifact PUT: %d, expected %d", res.StatusCode, http.StatusCreated)
+	}
+
+	// 3. Query the referrers endpoint.
+	referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", testEnv.server.URL, repo.Name(), subjectDigest)
+	resp, err := http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("failed to GET referrers: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status for referrers GET: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != v1.MediaTypeImageIndex {
+		t.Errorf("unexpected Content-Type: %q, expected %q", ct, v1.MediaTypeImageIndex)
+	}
+
+	var index v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+		t.Fatalf("failed to decode referrers response: %s", err)
+	}
+
+	if index.SchemaVersion != 2 {
+		t.Errorf("unexpected schemaVersion: %d", index.SchemaVersion)
+	}
+	if index.MediaType != v1.MediaTypeImageIndex {
+		t.Errorf("unexpected mediaType: %q", index.MediaType)
+	}
+	if len(index.Manifests) != 1 {
+		t.Fatalf("expected 1 referrer, got %d", len(index.Manifests))
+	}
+	if index.Manifests[0].Digest != artifactDigest {
+		t.Errorf("referrer digest mismatch: got %s, expected %s", index.Manifests[0].Digest, artifactDigest)
+	}
+	if index.Manifests[0].ArtifactType != "application/vnd.dev.sigstore.bundle.v0.3+json" {
+		t.Errorf("referrer artifactType mismatch: got %q", index.Manifests[0].ArtifactType)
+	}
+	if index.Manifests[0].MediaType != v1.MediaTypeImageManifest {
+		t.Errorf("referrer mediaType mismatch: got %q, expected %q", index.Manifests[0].MediaType, v1.MediaTypeImageManifest)
+	}
+
+	// 4. Test artifactType filtering — matching filter.
+	filteredURL := referrersURL + "?artifactType=" + url.QueryEscape("application/vnd.dev.sigstore.bundle.v0.3+json")
+	resp, err = http.Get(filteredURL)
+	if err != nil {
+		t.Fatalf("failed to GET filtered referrers: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status for filtered referrers GET: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("OCI-Filters-Applied") != "artifactType" {
+		t.Errorf("expected OCI-Filters-Applied header, got %q", resp.Header.Get("OCI-Filters-Applied"))
+	}
+
+	var filteredIndex v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&filteredIndex); err != nil {
+		t.Fatalf("failed to decode filtered response: %s", err)
+	}
+	if len(filteredIndex.Manifests) != 1 {
+		t.Fatalf("expected 1 filtered referrer, got %d", len(filteredIndex.Manifests))
+	}
+
+	// 5. Test artifactType filtering — non-matching filter.
+	noMatchURL := referrersURL + "?artifactType=application/vnd.example.nope"
+	resp, err = http.Get(noMatchURL)
+	if err != nil {
+		t.Fatalf("failed to GET non-matching referrers: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status for non-matching referrers GET: %d", resp.StatusCode)
+	}
+
+	var emptyIndex v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&emptyIndex); err != nil {
+		t.Fatalf("failed to decode empty response: %s", err)
+	}
+	if len(emptyIndex.Manifests) != 0 {
+		t.Errorf("expected 0 referrers for non-matching filter, got %d", len(emptyIndex.Manifests))
+	}
+
+	// 6. Test referrers for a digest with no referrers — should return empty index.
+	noRefURL := fmt.Sprintf("%s/v2/%s/referrers/%s", testEnv.server.URL, repo.Name(), artifactDigest)
+	resp, err = http.Get(noRefURL)
+	if err != nil {
+		t.Fatalf("failed to GET referrers for non-subject: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status for no-referrers GET: %d", resp.StatusCode)
+	}
+
+	var noRefIndex v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&noRefIndex); err != nil {
+		t.Fatalf("failed to decode no-referrers response: %s", err)
+	}
+	if len(noRefIndex.Manifests) != 0 {
+		t.Errorf("expected 0 referrers, got %d", len(noRefIndex.Manifests))
+	}
+}
+
+func TestReferrersConcurrentPushes(t *testing.T) {
+	env := newFilesystemTestEnv(t, true)
+	defer env.Shutdown()
+
+	repo, err := reference.WithName("test/concurrent-referrers")
+	if err != nil {
+		t.Fatalf("creating repository name: %v", err)
+	}
+	subject := testManifestAPISchema2(t, env, repo, "subject")
+	_, subjectPayload, err := subject.manifest.Payload()
+	if err != nil {
+		t.Fatalf("getting subject payload: %v", err)
+	}
+	subjectDigest := digest.FromBytes(subjectPayload)
+	pushScratch(t, env, repo)
+
+	type push struct {
+		digest digest.Digest
+		url    string
+		media  string
+		body   []byte
+	}
+
+	const artifactType = "application/vnd.example.concurrent"
+	pushes := make([]push, 0, 16)
+	expected := make(map[digest.Digest]struct{})
+	for i := range 8 {
+		dgst, media, body := referrerArtifactPayload(t, subjectDigest, artifactType, fmt.Sprintf("distinct-%d", i))
+		ref, err := reference.WithDigest(repo, dgst)
+		if err != nil {
+			t.Fatalf("creating artifact reference: %v", err)
+		}
+		manifestURL, err := env.builder.BuildManifestURL(ref)
+		if err != nil {
+			t.Fatalf("building artifact URL: %v", err)
+		}
+		pushes = append(pushes, push{digest: dgst, url: manifestURL, media: media, body: body})
+		expected[dgst] = struct{}{}
+	}
+
+	duplicateDigest, duplicateMedia, duplicateBody := referrerArtifactPayload(t, subjectDigest, artifactType, "duplicate")
+	duplicateRef, err := reference.WithDigest(repo, duplicateDigest)
+	if err != nil {
+		t.Fatalf("creating duplicate artifact reference: %v", err)
+	}
+	duplicateURL, err := env.builder.BuildManifestURL(duplicateRef)
+	if err != nil {
+		t.Fatalf("building duplicate artifact URL: %v", err)
+	}
+	for range 8 {
+		pushes = append(pushes, push{digest: duplicateDigest, url: duplicateURL, media: duplicateMedia, body: duplicateBody})
+	}
+	expected[duplicateDigest] = struct{}{}
+
+	start := make(chan struct{})
+	results := make(chan error, len(pushes))
+	var wg sync.WaitGroup
+	for _, work := range pushes {
+		wg.Add(1)
+		go func(push push) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodPut, push.url, bytes.NewReader(push.body))
+			if err == nil {
+				req.Header.Set("Content-Type", push.media)
+				var response *http.Response
+				response, err = http.DefaultClient.Do(req)
+				if err == nil {
+					response.Body.Close()
+					if response.StatusCode != http.StatusCreated {
+						err = fmt.Errorf("manifest push status = %d", response.StatusCode)
+					}
+				}
+			}
+			results <- err
+		}(work)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+
+	referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", env.server.URL, repo.Name(), subjectDigest)
+	response, err := http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("getting referrers: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("referrers status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+
+	var index v1.Index
+	if err := json.NewDecoder(response.Body).Decode(&index); err != nil {
+		t.Fatalf("decoding referrers response: %v", err)
+	}
+	if len(index.Manifests) != len(expected) {
+		t.Fatalf("referrers count = %d, want %d", len(index.Manifests), len(expected))
+	}
+	seen := make(map[digest.Digest]int)
+	for _, descriptor := range index.Manifests {
+		seen[descriptor.Digest]++
+	}
+	for dgst := range expected {
+		if seen[dgst] != 1 {
+			t.Errorf("referrer %s appears %d times, want 1", dgst, seen[dgst])
+		}
+	}
+}
+
+func referrerArtifactPayload(t *testing.T, subject digest.Digest, artifactType, annotation string) (digest.Digest, string, []byte) {
+	t.Helper()
+
+	manifest, err := ocischema.FromStruct(ocischema.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		ArtifactType: artifactType,
+		Config:       emptyJSONDescriptor,
+		Subject: &v1.Descriptor{
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    subject,
+		},
+		Annotations: map[string]string{"org.opencontainers.image.ref.name": annotation},
+	})
+	if err != nil {
+		t.Fatalf("creating referrer artifact: %v", err)
+	}
+	mediaType, payload, err := manifest.Payload()
+	if err != nil {
+		t.Fatalf("getting referrer artifact payload: %v", err)
+	}
+
+	return digest.FromBytes(payload), mediaType, payload
+}
+
+func TestFailedReferrerLinkLeavesManifestUnreachable(t *testing.T) {
+	for name, makeManifest := range map[string]func(*testing.T, *v1.Descriptor) distribution.Manifest{
+		"image_manifest": func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+			manifest, err := ocischema.FromStruct(ocischema.Manifest{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				ArtifactType: "application/vnd.example.link-failure",
+				Config:       emptyJSONDescriptor,
+				Subject:      subject,
+			})
+			if err != nil {
+				t.Fatalf("creating OCI image manifest: %v", err)
+			}
+			return manifest
+		},
+		"image_index": func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+			payload, err := json.Marshal(ocischema.ImageIndex{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				MediaType:    v1.MediaTypeImageIndex,
+				ArtifactType: "application/vnd.example.link-failure",
+				Subject:      subject,
+			})
+			if err != nil {
+				t.Fatalf("marshaling OCI image index: %v", err)
+			}
+			index := &ocischema.DeserializedImageIndex{}
+			if err := index.UnmarshalJSON(payload); err != nil {
+				t.Fatalf("creating OCI image index: %v", err)
+			}
+			return index
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newReferrerLinkFailureTestEnv(t)
+			defer env.Shutdown()
+
+			repo, err := reference.WithName("test/referrer-link-failure")
+			if err != nil {
+				t.Fatalf("creating repository name: %v", err)
+			}
+			subjectArgs := testManifestAPISchema2(t, env, repo, "subject")
+			_, subjectPayload, err := subjectArgs.manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting subject payload: %v", err)
+			}
+			pushScratch(t, env, repo)
+
+			subject := &v1.Descriptor{
+				MediaType: subjectArgs.mediaType,
+				Digest:    subjectArgs.dgst,
+				Size:      int64(len(subjectPayload)),
+			}
+			manifest := makeManifest(t, subject)
+			mediaType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting manifest payload: %v", err)
+			}
+			manifestDigest := digest.FromBytes(payload)
+			ref, err := reference.WithDigest(repo, manifestDigest)
+			if err != nil {
+				t.Fatalf("creating manifest reference: %v", err)
+			}
+			manifestURL, err := env.builder.BuildManifestURL(ref)
+			if err != nil {
+				t.Fatalf("building manifest URL: %v", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("creating manifest PUT request: %v", err)
+			}
+			req.Header.Set("Content-Type", mediaType)
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("putting manifest: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode == http.StatusCreated {
+				t.Fatal("failed referrer link returned 201 Created")
+			}
+
+			req, err = http.NewRequest(http.MethodGet, manifestURL, nil)
+			if err != nil {
+				t.Fatalf("creating manifest GET request: %v", err)
+			}
+			req.Header.Set("Accept", mediaType)
+			response, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("getting manifest by digest: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusNotFound {
+				t.Fatalf("manifest GET status = %d, want %d", response.StatusCode, http.StatusNotFound)
+			}
+
+			referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", env.server.URL, repo.Name(), subject.Digest)
+			response, err = http.Get(referrersURL)
+			if err != nil {
+				t.Fatalf("getting referrers: %v", err)
+			}
+			defer response.Body.Close()
+			var index v1.Index
+			if err := json.NewDecoder(response.Body).Decode(&index); err != nil {
+				t.Fatalf("decoding referrers response: %v", err)
+			}
+			if len(index.Manifests) != 0 {
+				t.Errorf("referrers count = %d, want 0", len(index.Manifests))
+			}
+		})
+	}
 }

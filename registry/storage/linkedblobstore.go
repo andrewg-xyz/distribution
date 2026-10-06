@@ -83,7 +83,16 @@ func (lbs *linkedBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter
 }
 
 func (lbs *linkedBlobStore) Put(ctx context.Context, mediaType string, p []byte) (v1.Descriptor, error) {
-	dgst := digest.FromBytes(p)
+	desc, err := lbs.put(ctx, mediaType, p)
+	if err != nil {
+		return v1.Descriptor{}, err
+	}
+
+	return desc, lbs.publish(ctx, desc)
+}
+
+// put stores content globally without making it available from this repository.
+func (lbs *linkedBlobStore) put(ctx context.Context, mediaType string, p []byte) (v1.Descriptor, error) {
 	// Place the data in the blob store first.
 	desc, err := lbs.blobStore.Put(ctx, mediaType, p)
 	if err != nil {
@@ -91,15 +100,20 @@ func (lbs *linkedBlobStore) Put(ctx context.Context, mediaType string, p []byte)
 		return v1.Descriptor{}, err
 	}
 
-	if err := lbs.blobAccessController.SetDescriptor(ctx, dgst, desc); err != nil {
-		return v1.Descriptor{}, err
-	}
-
 	// TODO(stevvooe): Write out mediatype if incoming differs from what is
 	// returned by Put above. Note that we should allow updates for a given
 	// repository.
 
-	return desc, lbs.linkBlob(ctx, desc)
+	return desc, nil
+}
+
+// publish makes globally stored content available from this repository.
+func (lbs *linkedBlobStore) publish(ctx context.Context, desc v1.Descriptor) error {
+	if err := lbs.linkBlob(ctx, desc); err != nil {
+		return err
+	}
+
+	return lbs.blobAccessController.SetDescriptor(ctx, desc.Digest, desc)
 }
 
 type optionFunc func(any) error

@@ -15,9 +15,10 @@ import (
 // ocischemaManifestHandler is a ManifestHandler that covers ocischema manifests.
 type ocischemaManifestHandler struct {
 	repository   distribution.Repository
-	blobStore    distribution.BlobStore
+	blobStore    *linkedBlobStore
 	ctx          context.Context
 	manifestURLs manifestURLs
+	references   ReferenceService
 }
 
 var _ ManifestHandler = &ocischemaManifestHandler{}
@@ -45,14 +46,35 @@ func (ms *ocischemaManifestHandler) Put(ctx context.Context, manifest distributi
 		return "", err
 	}
 
-	mt, payload, err := m.Payload()
+	mt, payload, err := manifest.Payload()
 	if err != nil {
 		return "", err
 	}
 
-	revision, err := ms.blobStore.Put(ctx, mt, payload)
+	return putManifest(ctx, ms.blobStore, ms.references, manifest, mt, payload)
+}
+
+func putManifest(ctx context.Context, blobStore *linkedBlobStore, references ReferenceService, manifest distribution.Manifest, mediaType string, payload []byte) (digest.Digest, error) {
+	referrer, ok := manifest.(distribution.Referrer)
+	if !ok || referrer.Subject() == nil {
+		revision, err := blobStore.Put(ctx, mediaType, payload)
+		if err != nil {
+			dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
+			return "", err
+		}
+		return revision.Digest, nil
+	}
+
+	revision, err := blobStore.put(ctx, mediaType, payload)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
+		return "", err
+	}
+
+	if err := references.Link(ctx, referrer.Type(), revision.Digest, referrer.Subject().Digest); err != nil {
+		return "", err
+	}
+	if err := blobStore.publish(ctx, revision); err != nil {
 		return "", err
 	}
 
@@ -88,7 +110,7 @@ func (ms *ocischemaManifestHandler) verifyManifest(ctx context.Context, mnfst oc
 		}
 
 		switch descriptor.MediaType {
-		case v1.MediaTypeImageLayer, v1.MediaTypeImageLayerGzip, v1.MediaTypeImageLayerNonDistributable, v1.MediaTypeImageLayerNonDistributableGzip: //nolint:staticcheck // ignore A1019: v1.MediaTypeImageLayerNonDistributable is deprecated: Non-distributable layers are deprecated, and not recommended for future use.
+		case v1.MediaTypeImageLayer, v1.MediaTypeImageLayerGzip, v1.MediaTypeImageLayerNonDistributable, v1.MediaTypeImageLayerNonDistributableGzip: //nolint:staticcheck // Ignore SA1019 v1.MediaTypeImageLayerNonDistributable is deprecated, it is used for backwards compatibility
 			allow := ms.manifestURLs.allow
 			deny := ms.manifestURLs.deny
 			for _, u := range descriptor.URLs {

@@ -169,11 +169,11 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if manifestType == ociSchema && !supports[ociSchema] {
-		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestNotAcceptable.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
 		return
 	}
 	if manifestType == ociImageIndexSchema && !supports[ociImageIndexSchema] {
-		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI index found, but accept header does not support OCI indexes"))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestNotAcceptable.WithMessage("OCI index found, but accept header does not support OCI indexes"))
 		return
 	}
 
@@ -363,6 +363,9 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Location", location)
 	w.Header().Set("Docker-Content-Digest", imh.Digest.String())
+	if referrer, ok := manifest.(distribution.Referrer); ok && referrer.Subject() != nil {
+		w.Header().Set("OCI-Subject", referrer.Subject().Digest.String())
+	}
 	w.WriteHeader(http.StatusCreated)
 
 	dcontext.GetLogger(imh).Debug("Succeeded in putting manifest!")

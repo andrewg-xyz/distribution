@@ -15,9 +15,10 @@ import (
 // manifestListHandler is a ManifestHandler that covers schema2 manifest lists.
 type manifestListHandler struct {
 	repository           distribution.Repository
-	blobStore            distribution.BlobStore
+	blobStore            *linkedBlobStore
 	ctx                  context.Context
 	validateImageIndexes validateImageIndexes
+	references           ReferenceService
 }
 
 var _ ManifestHandler = &manifestListHandler{}
@@ -60,13 +61,7 @@ func (ms *manifestListHandler) Put(ctx context.Context, manifestList distributio
 		return "", err
 	}
 
-	revision, err := ms.blobStore.Put(ctx, mt, payload)
-	if err != nil {
-		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
-		return "", err
-	}
-
-	return revision.Digest, nil
+	return putManifest(ctx, ms.blobStore, ms.references, manifestList, mt, payload)
 }
 
 // verifyManifest ensures that the manifest content is valid from the
