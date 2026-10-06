@@ -1455,6 +1455,33 @@ type mockErrorDriver struct {
 	returnErrs []mockErrorMapping
 }
 
+const referrerLinkFailureDriverName = "referrerlinkfailure"
+
+var registerReferrerLinkFailureDriver sync.Once
+
+type referrerLinkFailureDriverFactory struct{}
+
+func (f *referrerLinkFailureDriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
+	driver, err := factory.Create(ctx, "inmemory", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &referrerLinkFailureDriver{StorageDriver: driver}, nil
+}
+
+type referrerLinkFailureDriver struct {
+	storagedriver.StorageDriver
+}
+
+func (driver *referrerLinkFailureDriver) PutContent(ctx context.Context, path string, content []byte) error {
+	if strings.Contains(path, "_referrers") {
+		return errors.New("injected referrer link failure")
+	}
+
+	return driver.StorageDriver.PutContent(ctx, path, content)
+}
+
 func (dr *mockErrorDriver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	for _, returns := range dr.returnErrs {
 		if strings.Contains(path, returns.pathMatch) {
@@ -2279,6 +2306,25 @@ func newFilesystemTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
 		Storage: configuration.Storage{
 			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
 			"delete":     configuration.Parameters{"enabled": deleteEnabled},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+
+	return newTestEnvWithConfig(t, &config)
+}
+
+func newReferrerLinkFailureTestEnv(t *testing.T) *testEnv {
+	registerReferrerLinkFailureDriver.Do(func() {
+		factory.Register(referrerLinkFailureDriverName, &referrerLinkFailureDriverFactory{})
+	})
+
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			referrerLinkFailureDriverName: configuration.Parameters{},
+			"delete":                      configuration.Parameters{"enabled": true},
 			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
@@ -3825,4 +3871,115 @@ func referrerArtifactPayload(t *testing.T, subject digest.Digest, artifactType, 
 	}
 
 	return digest.FromBytes(payload), mediaType, payload
+}
+
+func TestFailedReferrerLinkLeavesManifestUnreachable(t *testing.T) {
+	for name, makeManifest := range map[string]func(*testing.T, *v1.Descriptor) distribution.Manifest{
+		"image_manifest": func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+			manifest, err := ocischema.FromStruct(ocischema.Manifest{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				ArtifactType: "application/vnd.example.link-failure",
+				Config:       emptyJSONDescriptor,
+				Subject:      subject,
+			})
+			if err != nil {
+				t.Fatalf("creating OCI image manifest: %v", err)
+			}
+			return manifest
+		},
+		"image_index": func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+			payload, err := json.Marshal(ocischema.ImageIndex{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				MediaType:    v1.MediaTypeImageIndex,
+				ArtifactType: "application/vnd.example.link-failure",
+				Subject:      subject,
+			})
+			if err != nil {
+				t.Fatalf("marshaling OCI image index: %v", err)
+			}
+			index := &ocischema.DeserializedImageIndex{}
+			if err := index.UnmarshalJSON(payload); err != nil {
+				t.Fatalf("creating OCI image index: %v", err)
+			}
+			return index
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newReferrerLinkFailureTestEnv(t)
+			defer env.Shutdown()
+
+			repo, err := reference.WithName("test/referrer-link-failure")
+			if err != nil {
+				t.Fatalf("creating repository name: %v", err)
+			}
+			subjectArgs := testManifestAPISchema2(t, env, repo, "subject")
+			_, subjectPayload, err := subjectArgs.manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting subject payload: %v", err)
+			}
+			pushScratch(t, env, repo)
+
+			subject := &v1.Descriptor{
+				MediaType: subjectArgs.mediaType,
+				Digest:    subjectArgs.dgst,
+				Size:      int64(len(subjectPayload)),
+			}
+			manifest := makeManifest(t, subject)
+			mediaType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting manifest payload: %v", err)
+			}
+			manifestDigest := digest.FromBytes(payload)
+			ref, err := reference.WithDigest(repo, manifestDigest)
+			if err != nil {
+				t.Fatalf("creating manifest reference: %v", err)
+			}
+			manifestURL, err := env.builder.BuildManifestURL(ref)
+			if err != nil {
+				t.Fatalf("building manifest URL: %v", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("creating manifest PUT request: %v", err)
+			}
+			req.Header.Set("Content-Type", mediaType)
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("putting manifest: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode == http.StatusCreated {
+				t.Fatal("failed referrer link returned 201 Created")
+			}
+
+			req, err = http.NewRequest(http.MethodGet, manifestURL, nil)
+			if err != nil {
+				t.Fatalf("creating manifest GET request: %v", err)
+			}
+			req.Header.Set("Accept", mediaType)
+			response, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("getting manifest by digest: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusNotFound {
+				t.Fatalf("manifest GET status = %d, want %d", response.StatusCode, http.StatusNotFound)
+			}
+
+			referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", env.server.URL, repo.Name(), subject.Digest)
+			response, err = http.Get(referrersURL)
+			if err != nil {
+				t.Fatalf("getting referrers: %v", err)
+			}
+			defer response.Body.Close()
+			var index v1.Index
+			if err := json.NewDecoder(response.Body).Decode(&index); err != nil {
+				t.Fatalf("decoding referrers response: %v", err)
+			}
+			if len(index.Manifests) != 0 {
+				t.Errorf("referrers count = %d, want 0", len(index.Manifests))
+			}
+		})
+	}
 }

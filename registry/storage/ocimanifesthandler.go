@@ -15,7 +15,7 @@ import (
 // ocischemaManifestHandler is a ManifestHandler that covers ocischema manifests.
 type ocischemaManifestHandler struct {
 	repository   distribution.Repository
-	blobStore    distribution.BlobStore
+	blobStore    *linkedBlobStore
 	ctx          context.Context
 	manifestURLs manifestURLs
 	references   ReferenceService
@@ -51,26 +51,34 @@ func (ms *ocischemaManifestHandler) Put(ctx context.Context, manifest distributi
 		return "", err
 	}
 
-	revision, err := ms.blobStore.Put(ctx, mt, payload)
+	return putManifest(ctx, ms.blobStore, ms.references, manifest, mt, payload)
+}
+
+func putManifest(ctx context.Context, blobStore *linkedBlobStore, references ReferenceService, manifest distribution.Manifest, mediaType string, payload []byte) (digest.Digest, error) {
+	referrer, ok := manifest.(distribution.Referrer)
+	if !ok || referrer.Subject() == nil {
+		revision, err := blobStore.Put(ctx, mediaType, payload)
+		if err != nil {
+			dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
+			return "", err
+		}
+		return revision.Digest, nil
+	}
+
+	revision, err := blobStore.put(ctx, mediaType, payload)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
 		return "", err
 	}
 
-	if err := linkReferrer(ctx, ms.references, manifest, revision.Digest); err != nil {
+	if err := references.Link(ctx, referrer.Type(), revision.Digest, referrer.Subject().Digest); err != nil {
+		return "", err
+	}
+	if err := blobStore.publish(ctx, revision); err != nil {
 		return "", err
 	}
 
 	return revision.Digest, nil
-}
-
-func linkReferrer(ctx context.Context, references ReferenceService, manifest distribution.Manifest, revision digest.Digest) error {
-	referrer, ok := manifest.(distribution.Referrer)
-	if !ok || referrer.Subject() == nil {
-		return nil
-	}
-
-	return references.Link(ctx, referrer.Type(), revision, referrer.Subject().Digest)
 }
 
 // verifyManifest ensures that the manifest content is valid from the
