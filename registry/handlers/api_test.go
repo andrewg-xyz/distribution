@@ -3104,6 +3104,143 @@ func TestArtifactManifest(t *testing.T) {
 	}
 }
 
+func TestManifestPutOCISubjectHeader(t *testing.T) {
+	subject := v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    v1.DescriptorEmptyJSON.Digest,
+		Size:      v1.DescriptorEmptyJSON.Size,
+	}
+
+	for name, test := range map[string]struct {
+		manifest func(*testing.T, *v1.Descriptor) distribution.Manifest
+		byDigest bool
+		subject  *v1.Descriptor
+	}{
+		"image_manifest_by_tag_with_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					ArtifactType: "application/vnd.example.artifact",
+					Config:       emptyJSONDescriptor,
+					Subject:      subject,
+				})
+				if err != nil {
+					t.Fatalf("creating OCI image manifest: %v", err)
+				}
+				return manifest
+			},
+			subject: &subject,
+		},
+		"image_manifest_by_digest_without_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				manifest, err := ocischema.FromStruct(ocischema.Manifest{
+					Versioned:    specs.Versioned{SchemaVersion: 2},
+					ArtifactType: "application/vnd.example.artifact",
+					Config:       emptyJSONDescriptor,
+					Subject:      subject,
+				})
+				if err != nil {
+					t.Fatalf("creating OCI image manifest: %v", err)
+				}
+				return manifest
+			},
+			byDigest: true,
+		},
+		"image_index_by_tag_without_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned: specs.Versioned{SchemaVersion: 2},
+					MediaType: v1.MediaTypeImageIndex,
+					Subject:   subject,
+				})
+				if err != nil {
+					t.Fatalf("marshaling OCI image index: %v", err)
+				}
+				index := &ocischema.DeserializedImageIndex{}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("creating OCI image index: %v", err)
+				}
+				return index
+			},
+		},
+		"image_index_by_digest_with_subject": {
+			manifest: func(t *testing.T, subject *v1.Descriptor) distribution.Manifest {
+				payload, err := json.Marshal(ocischema.ImageIndex{
+					Versioned: specs.Versioned{SchemaVersion: 2},
+					MediaType: v1.MediaTypeImageIndex,
+					Subject:   subject,
+				})
+				if err != nil {
+					t.Fatalf("marshaling OCI image index: %v", err)
+				}
+				index := &ocischema.DeserializedImageIndex{}
+				if err := index.UnmarshalJSON(payload); err != nil {
+					t.Fatalf("creating OCI image index: %v", err)
+				}
+				return index
+			},
+			byDigest: true,
+			subject:  &subject,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t, true)
+			defer env.Shutdown()
+
+			repo, err := reference.WithName("test/oci-subject")
+			if err != nil {
+				t.Fatalf("creating repository name: %v", err)
+			}
+			pushScratch(t, env, repo)
+
+			manifest := test.manifest(t, test.subject)
+			mediaType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("getting manifest payload: %v", err)
+			}
+
+			var manifestURL string
+			if test.byDigest {
+				ref, err := reference.WithDigest(repo, digest.FromBytes(payload))
+				if err == nil {
+					manifestURL, err = env.builder.BuildManifestURL(ref)
+				}
+			} else {
+				ref, err := reference.WithTag(repo, "latest")
+				if err == nil {
+					manifestURL, err = env.builder.BuildManifestURL(ref)
+				}
+			}
+			if err != nil {
+				t.Fatalf("creating manifest reference: %v", err)
+			}
+
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("creating manifest PUT request: %v", err)
+			}
+			req.Header.Set("Content-Type", mediaType)
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("putting manifest: %v", err)
+			}
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusCreated {
+				t.Fatalf("unexpected manifest PUT status: %d", res.StatusCode)
+			}
+
+			wantSubject := ""
+			if test.subject != nil {
+				wantSubject = test.subject.Digest.String()
+			}
+			if gotSubject := res.Header.Get("OCI-Subject"); gotSubject != wantSubject {
+				t.Errorf("OCI-Subject = %q, want %q", gotSubject, wantSubject)
+			}
+		})
+	}
+}
+
 func TestDockerManifestWithSubject(t *testing.T) {
 	// When a docker image manifest containing a "subject" field is uploaded
 	// then no referrer links are made for that invalid subject.
